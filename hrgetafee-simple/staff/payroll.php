@@ -2,6 +2,7 @@
 session_start();
 require_once '../config/database.php';
 require_once '../includes/functions.php';
+require_once '../includes/payroll_functions.php';
 
 require_login();
 check_role(2);
@@ -9,68 +10,6 @@ check_role(2);
 $staff = get_employee_info($conn, $_SESSION['employee_id']);
 $message = '';
 $error = '';
-
-// Tax configuration
-define('TAX_RATE', 0.12);           // 12% income tax
-define('ABSENCE_DEDUCTION', 500);   // ₱500 per absence
-define('LATE_DEDUCTION', 100);      // ₱100 per late arrival
-
-// Calculate payroll with detailed breakdown
-function calculate_payroll($conn, $employee_id, $month, $year) {
-    $employee = get_employee_info($conn, $employee_id);
-    $gross_salary = floatval($employee['salary']);
-    
-    // Get attendance data for the month
-    $start_date = "$year-" . str_pad($month, 2, '0', STR_PAD_LEFT) . "-01";
-    $end_date = date('Y-m-t', strtotime($start_date));
-    
-    $attendance = $conn->query(
-        "SELECT status FROM attendance WHERE employee_id = $employee_id AND attendance_date BETWEEN '$start_date' AND '$end_date'"
-    )->fetch_all(MYSQLI_ASSOC);
-    
-    // Count absences and lates
-    $absences = 0;
-    $lates = 0;
-    $present_days = 0;
-    
-    foreach ($attendance as $record) {
-        if ($record['status'] === 'absent') {
-            $absences++;
-        } elseif ($record['status'] === 'late') {
-            $lates++;
-        } elseif ($record['status'] === 'present') {
-            $present_days++;
-        }
-    }
-    
-    // Get approved leaves for the month
-    $leaves = $conn->query(
-        "SELECT COALESCE(SUM(number_of_days), 0) as leave_days FROM leave_requests 
-         WHERE employee_id = $employee_id AND status = 'approved' 
-         AND start_date <= '$end_date' AND end_date >= '$start_date'"
-    )->fetch_assoc()['leave_days'];
-    
-    // Calculate deductions
-    $absence_deduction = $absences * ABSENCE_DEDUCTION;
-    $late_deduction = $lates * LATE_DEDUCTION;
-    $tax_deduction = $gross_salary * TAX_RATE;
-    
-    $total_deductions = $absence_deduction + $late_deduction + $tax_deduction;
-    $net_salary = $gross_salary - $total_deductions;
-    
-    return [
-        'gross_salary' => $gross_salary,
-        'absences' => $absences,
-        'lates' => $lates,
-        'approved_leaves' => $leaves,
-        'present_days' => $present_days,
-        'absence_deduction' => $absence_deduction,
-        'late_deduction' => $late_deduction,
-        'tax_deduction' => $tax_deduction,
-        'total_deductions' => $total_deductions,
-        'net_salary' => $net_salary
-    ];
-}
 
 // Handle preview payroll (for review before processing)
 $payroll_preview = null;
@@ -80,11 +19,15 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['preview_payroll'])) {
     $year = (int)$_POST['year'];
     
     if ($employee_id && $month && $year) {
-        $payroll_preview = calculate_payroll($conn, $employee_id, $month, $year);
+        $payroll_preview = calculate_enhanced_payroll($conn, $employee_id, $month, $year);
         $payroll_preview['employee_id'] = $employee_id;
         $payroll_preview['month'] = $month;
         $payroll_preview['year'] = $year;
         $payroll_preview['employee_name'] = get_employee_name($conn, $employee_id);
+        
+        // Get leave earned information
+        $leave_earned = calculate_leave_earned($conn, $employee_id, $month, $year);
+        $payroll_preview['leave_earned'] = $leave_earned;
     }
 }
 
@@ -99,7 +42,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['confirm_payroll'])) {
     if ($check->num_rows > 0) {
         $error = '<div class="alert alert-danger"><strong>Error:</strong> Payroll already processed for this employee in this period.</div>';
     } else {
-        $payroll_data = calculate_payroll($conn, $employee_id, $month, $year);
+        $payroll_data = calculate_enhanced_payroll($conn, $employee_id, $month, $year);
         
         $stmt = $conn->prepare(
             "INSERT INTO payroll (employee_id, payroll_month, payroll_year, gross_salary, deductions, net_salary, status) 
@@ -116,8 +59,15 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['confirm_payroll'])) {
         );
         
         if ($stmt->execute()) {
-            $message = '<div class="alert alert-success">✓ Payroll processed successfully</div>';
-            $payroll_preview = null;
+            $payroll_id = $stmt->insert_id;
+            
+            // Save detailed breakdown
+            if (save_payroll_details($conn, $payroll_id, $payroll_data)) {
+                $message = '<div class="alert alert-success">✓ Payroll processed successfully with detailed breakdown saved</div>';
+                $payroll_preview = null;
+            } else {
+                $message = '<div class="alert alert-warning">✓ Payroll processed but error saving details</div>';
+            }
         } else {
             $error = '<div class="alert alert-danger">Error processing payroll</div>';
         }
@@ -143,7 +93,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['mark_paid'])) {
 // Get employees
 $employees = $conn->query("SELECT * FROM employees WHERE status = 'active' ORDER BY first_name")->fetch_all(MYSQLI_ASSOC);
 
-// Get payroll records
+// Get payroll records with details
 $payroll = $conn->query(
     "SELECT p.*, e.first_name, e.last_name, e.employee_code FROM payroll p 
      JOIN employees e ON p.employee_id = e.employee_id 
@@ -258,9 +208,10 @@ $payroll = $conn->query(
             padding: 30px;
             border: 2px solid #667eea;
             border-radius: 8px;
-            max-width: 600px;
+            max-width: 800px;
             margin: 20px auto;
             font-family: 'Courier New', monospace;
+            font-size: 13px;
         }
         
         .slip-header {
@@ -283,16 +234,35 @@ $payroll = $conn->query(
             padding: 12px 0;
         }
         
+        .slip-section {
+            margin-top: 15px;
+            padding-top: 10px;
+            border-top: 1px solid #ddd;
+        }
+        
         .grid-2 {
             display: grid;
             grid-template-columns: 1fr 1fr;
             gap: 20px;
         }
+        
+        .badge {
+            display: inline-block;
+            padding: 5px 10px;
+            border-radius: 4px;
+            font-size: 12px;
+            font-weight: 600;
+        }
+        
+        .badge-info {
+            background: #e3f2fd;
+            color: #1976d2;
+        }
     </style>
 </head>
 <body>
     <div class="navbar">
-        <h2>Payroll Management</h2>
+        <h2>Payroll Management (Enhanced)</h2>
         <div class="navbar-user">
             <span>Welcome, <strong><?php echo htmlspecialchars($staff['first_name']); ?></strong></span>
             <a href="../logout.php">Logout</a>
@@ -307,9 +277,9 @@ $payroll = $conn->query(
 
         <!-- Process Payroll Form -->
         <div class="payroll-section">
-            <h3>💰 Process Payroll</h3>
+            <h3>💰 Process Payroll (Enhanced with CPF, CBIF, MPL)</h3>
             <p style="color: #666; margin-bottom: 20px;">
-                Select an employee and month to calculate payroll based on attendance and approved leaves.
+                Select an employee and month to calculate payroll based on attendance, approved leaves, and all statutory deductions.
             </p>
             
             <form method="POST" style="max-width: 500px;">
@@ -319,7 +289,7 @@ $payroll = $conn->query(
                         <option value="">-- Select Employee --</option>
                         <?php foreach ($employees as $emp): ?>
                             <option value="<?php echo $emp['employee_id']; ?>" <?php echo (isset($_POST['employee_id']) && $_POST['employee_id'] == $emp['employee_id'] ? 'selected' : ''); ?>>
-                                <?php echo htmlspecialchars($emp['first_name'] . ' ' . $emp['last_name']); ?>
+                                <?php echo htmlspecialchars($emp['first_name'] . ' ' . $emp['last_name']); ?> (<?php echo htmlspecialchars($emp['position']); ?>)
                             </option>
                         <?php endforeach; ?>
                     </select>
@@ -359,8 +329,13 @@ $payroll = $conn->query(
                     <strong>Period:</strong>
                     <strong><?php echo $payroll_preview['month'] . '/' . $payroll_preview['year']; ?></strong>
                 </div>
+                <div class="slip-row">
+                    <strong>AMS (Service):</strong>
+                    <strong><?php echo number_format($payroll_preview['ams'], 1); ?> years</strong>
+                </div>
                 
-                <div style="margin-top: 15px; margin-bottom: 15px; border-top: 1px solid #ddd; padding-top: 15px;">
+                <!-- Attendance Summary -->
+                <div class="slip-section">
                     <h4 style="margin: 0 0 10px 0; color: #667eea;">Attendance Summary</h4>
                     <div class="slip-row">
                         <span>Present Days:</span>
@@ -380,39 +355,87 @@ $payroll = $conn->query(
                     </div>
                 </div>
                 
-                <div style="margin-top: 15px; margin-bottom: 15px; border-top: 1px solid #ddd; padding-top: 15px;">
+                <!-- Leave Earned Information -->
+                <div class="slip-section">
+                    <h4 style="margin: 0 0 10px 0; color: #667eea;">Leave Earned (Based on AMS)</h4>
+                    <div class="slip-row">
+                        <span>Leave Earned (Days):</span>
+                        <span><?php echo number_format($payroll_preview['leave_earned']['leave_earned_days'], 3); ?> days</span>
+                    </div>
+                    <div class="slip-row">
+                        <span>Leave Value:</span>
+                        <span><?php echo format_currency($payroll_preview['leave_earned']['leave_earned_amount']); ?></span>
+                    </div>
+                </div>
+                
+                <!-- Earnings & Deductions -->
+                <div class="slip-section">
                     <h4 style="margin: 0 0 10px 0;">Earnings & Deductions</h4>
                     <div class="slip-row">
                         <span>Gross Salary:</span>
-                        <span style="color: #2e7d32; font-weight: bold;">₱<?php echo number_format($payroll_preview['gross_salary'], 2); ?></span>
+                        <span style="color: #2e7d32; font-weight: bold;"><?php echo format_currency($payroll_preview['gross_salary']); ?></span>
                     </div>
                     
-                    <div style="margin-top: 10px; margin-bottom: 5px; font-size: 12px; color: #c62828; font-weight: bold;">DEDUCTIONS:</div>
+                    <div style="margin-top: 10px; margin-bottom: 5px; font-size: 12px; color: #c62828; font-weight: bold;">STATUTORY DEDUCTIONS:</div>
+                    
+                    <div class="slip-row" style="background: #fff3cd; margin-bottom: 5px;">
+                        <span style="font-size: 12px;">SSS Contribution (3.63%)</span>
+                        <span style="color: #c62828;">-<?php echo format_currency($payroll_preview['sss_deduction']); ?></span>
+                    </div>
+                    
+                    <div class="slip-row" style="background: #fff3cd; margin-bottom: 5px;">
+                        <span style="font-size: 12px;">PhilHealth Premium (2.75%)</span>
+                        <span style="color: #c62828;">-<?php echo format_currency($payroll_preview['philhealth_deduction']); ?></span>
+                    </div>
+                    
+                    <div class="slip-row" style="background: #fff3cd; margin-bottom: 5px;">
+                        <span style="font-size: 12px;">Pag-IBIG (2.00%)</span>
+                        <span style="color: #c62828;">-<?php echo format_currency($payroll_preview['pagibig_deduction']); ?></span>
+                    </div>
+                    
+                    <div style="margin-top: 10px; margin-bottom: 5px; font-size: 12px; color: #c62828; font-weight: bold;">SPECIAL DEDUCTIONS:</div>
                     
                     <div class="slip-row" style="background: #ffebee; margin-bottom: 5px;">
-                        <span style="font-size: 12px;">Absence Deduction (<?php echo $payroll_preview['absences']; ?> × ₱<?php echo ABSENCE_DEDUCTION; ?>)</span>
-                        <span style="color: #c62828;">-₱<?php echo number_format($payroll_preview['absence_deduction'], 2); ?></span>
+                        <span style="font-size: 12px;">CPF (Consolidated Police Fund)</span>
+                        <span style="color: #c62828;">-<?php echo format_currency($payroll_preview['cpf_deduction']); ?></span>
                     </div>
                     
                     <div class="slip-row" style="background: #ffebee; margin-bottom: 5px;">
-                        <span style="font-size: 12px;">Late Deduction (<?php echo $payroll_preview['lates']; ?> × ₱<?php echo LATE_DEDUCTION; ?>)</span>
-                        <span style="color: #c62828;">-₱<?php echo number_format($payroll_preview['late_deduction'], 2); ?></span>
+                        <span style="font-size: 12px;">CBIF (Comprehensive Benefit Insurance)</span>
+                        <span style="color: #c62828;">-<?php echo format_currency($payroll_preview['cbif_deduction']); ?></span>
+                    </div>
+                    
+                    <div class="slip-row" style="background: #ffebee; margin-bottom: 5px;">
+                        <span style="font-size: 12px;">MPL (Magna Carta for Public Employees)</span>
+                        <span style="color: #c62828;">-<?php echo format_currency($payroll_preview['mpl_deduction']); ?></span>
+                    </div>
+                    
+                    <div style="margin-top: 10px; margin-bottom: 5px; font-size: 12px; color: #c62828; font-weight: bold;">VARIABLE DEDUCTIONS:</div>
+                    
+                    <div class="slip-row" style="background: #ffebee; margin-bottom: 5px;">
+                        <span style="font-size: 12px;">Absence Deduction (<?php echo $payroll_preview['absences']; ?> × ₱500)</span>
+                        <span style="color: #c62828;">-<?php echo format_currency($payroll_preview['absence_deduction']); ?></span>
+                    </div>
+                    
+                    <div class="slip-row" style="background: #ffebee; margin-bottom: 5px;">
+                        <span style="font-size: 12px;">Late Deduction (<?php echo $payroll_preview['lates']; ?> × ₱100)</span>
+                        <span style="color: #c62828;">-<?php echo format_currency($payroll_preview['late_deduction']); ?></span>
                     </div>
                     
                     <div class="slip-row" style="background: #ffebee;">
-                        <span style="font-size: 12px;">Tax (<?php echo (TAX_RATE * 100); ?>%)</span>
-                        <span style="color: #c62828;">-₱<?php echo number_format($payroll_preview['tax_deduction'], 2); ?></span>
+                        <span style="font-size: 12px;">BIR Income Tax (12%)</span>
+                        <span style="color: #c62828;">-<?php echo format_currency($payroll_preview['bir_deduction']); ?></span>
                     </div>
                     
                     <div class="slip-row" style="margin-top: 10px; background: #f0f0f0; font-weight: bold;">
                         <span>Total Deductions:</span>
-                        <span>-₱<?php echo number_format($payroll_preview['total_deductions'], 2); ?></span>
+                        <span>-<?php echo format_currency($payroll_preview['total_deductions']); ?></span>
                     </div>
                 </div>
                 
                 <div class="slip-row total" style="font-size: 16px; margin-top: 15px;">
                     <span>NET SALARY:</span>
-                    <span style="color: #2e7d32;">₱<?php echo number_format($payroll_preview['net_salary'], 2); ?></span>
+                    <span style="color: #2e7d32;"><?php echo format_currency($payroll_preview['net_salary']); ?></span>
                 </div>
             </div>
             
@@ -452,11 +475,11 @@ $payroll = $conn->query(
                     <?php if (!empty($payroll)): ?>
                         <?php foreach ($payroll as $pay): ?>
                         <tr>
-                            <td><strong><?php echo htmlspecialchars($pay['first_name'] . ' ' . $pay['last_name']); ?></strong></td>
+                            <td><strong><?php echo htmlspecialchars($pay['first_name'] . ' ' . $pay['last_name']); ?></strong><br><small><?php echo $pay['employee_code']; ?></small></td>
                             <td><?php echo $pay['payroll_month'] . '/' . $pay['payroll_year']; ?></td>
-                            <td>₱<?php echo number_format($pay['gross_salary'], 2); ?></td>
-                            <td>₱<?php echo number_format($pay['deductions'], 2); ?></td>
-                            <td><strong>₱<?php echo number_format($pay['net_salary'], 2); ?></strong></td>
+                            <td><?php echo format_currency($pay['gross_salary']); ?></td>
+                            <td><?php echo format_currency($pay['deductions']); ?></td>
+                            <td><strong><?php echo format_currency($pay['net_salary']); ?></strong></td>
                             <td>
                                 <span class="badge <?php echo ($pay['status'] === 'paid' ? 'badge-success' : 'badge-warning'); ?>">
                                     <?php echo ucfirst($pay['status']); ?>
